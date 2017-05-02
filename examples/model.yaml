@@ -1,0 +1,52 @@
+doctype: "com.datagridsys.doctype/skopos/model"
+version: 1
+
+components:
+  front:
+    image: datagridsys/sample-front:1.1
+    replicas: 2
+
+    provides:
+      ports:
+        - "80/tcp"
+
+    uses:
+        back: {}
+
+    visual: { x: 350, y: 200 }
+
+  back:
+    image: datagridsys/sample-back:1.0
+    replicas: 2
+
+    provides:
+      ports:
+        - "8080/tcp"
+
+    visual: { x: 650, y: 200 }
+
+    lifecycle:
+      quality_probe:
+        steps:
+          - call:
+              label: "execute a command" # text to show in plan view
+              plugin: swarm-exec
+              action: inst_exec
+              arguments:
+                selector: new 		# required, don't change
+                command: "sleep 3"      # command to execute, single string
+                timeout: 30             # optional timeout, default 300 sec
+
+gateways:
+  in:
+    type: load_balancer
+    target: [ front ]
+    exposes:
+      - name: http
+        port: 80
+        target_port: 80
+        # remap: true
+
+    visual: { x: 50, y: 200 }
+
+

@@ -1,0 +1,378 @@
+#!/usr/bin/python3
+#
+# docker-swarm - Skopos plugin for Docker Swarm
+#
+# Copyright (c) 2017, Datagrid Systems, Inc.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+#    this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+#
+# License template: http://opensource.org/licenses/BSD-2-Clause
+#                   (as accessed on June 2, 2015)
+
+from __future__ import print_function
+import six      # best effort to make it py2-compatible but not tested/indended for py2
+
+import sys
+import json
+import re
+import time
+from copy import copy
+
+import docker  # Docker engine SDK
+
+import skpp    # Skopos plugin helper
+
+
+# --- Helpful definitions
+
+DFLT_TIMEOUT = 300 # (seconds) max. time to allow command to run
+DFLT_IMAGE = 'datagridsys/skopos-plugin-swarm-exec:latest'
+
+ACTIVE_STATES = {
+    'new',
+    'allocated',
+    'pending',
+    'assigned',
+    'accepted',
+    'preparing',
+    'ready',
+    'starting',
+    'running',
+    }
+
+# exception to use when reporting Docker API errors that we don't handle internally
+class ApiError(Exception):
+    pass
+
+# exception to use when reporting user errors
+class UserError(Exception):
+    pass
+
+# exception to use when reporting command errors
+class CmdError(Exception):
+    pass
+
+# Skopos action decorator
+def action(f):
+    def w(**kw):
+        _connect_api(manager = True)
+
+        # invoke action function
+        exc = None
+        try:
+            ret = f(**kw)
+        except docker.errors.DockerException as e:
+            exc = ApiError(e.args[0])
+            ret = None
+        except Exception as e:
+            exc = e
+            ret = None
+        if ret is None: ret = {}    # allow actions to return None but keep return value as a dict
+        #err = None if not exc else exc.args[0]   # TODO: capture and save the traceback
+        #_log_action(f.__name__, kw, res = ret, err = err)
+        if exc:
+            raise exc
+
+        # merge ret into the original bus and print
+        kw.update(ret)
+        return kw
+
+    # make it look nice on help(f)
+    w.__doc__  = f.__doc__
+    w.__name__ = f.__name__
+    return skpp.action(w)
+
+# ---
+
+def _connect_api(manager=False):
+    global gbl_api
+
+    # connect to API, omit stack trace on error
+    try:
+        client = docker.from_env()
+    except docker.errors.DockerException as e:
+        raise ApiError(e.args[0])
+    try:
+        client.version()    # verify we can talk to the engine
+    except docker.errors.DockerException as e:
+        raise ApiError(e.args[0])
+    except Exception as e:
+        raise ApiError("error connecting to Docker engine: {}: {}".format(type(e).__name__, e.args[0]))
+    if manager:
+        #TODO check if it is a manager node, fail if not
+        pass
+    gbl_api = client
+
+
+def task_info(task_id):
+    try:
+        return gbl_api.services.client.api.inspect_task(task_id)
+    except docker.errors.DockerException as e:
+        raise ApiError(e.args[0])
+
+def task_node(tinfo):
+    x = tinfo.get('NodeID')
+    if not x:
+        try:
+            _id = tinfo['ID']
+        except Exception:
+            _id = '(unknown)'
+        raise UserError('no NodeID attribute in task {}'.format(_id))
+    return x
+
+def task_container(tinfo):
+    x = tinfo.get('Status',{}).get('ContainerStatus',{}).get('ContainerID')
+    if not x:
+        try:
+            _id = tinfo['ID']
+        except Exception:
+            _id = '(unknown)'
+        raise UserError('no NodeID attribute in task {}'.format(_id))
+    return x
+
+def task_active(tinfo):
+    try:
+        return (tinfo['Status']['State'] in ACTIVE_STATES)
+    except Exception:
+        return False
+
+def task_exec(task_id, cmd, timeout = DFLT_TIMEOUT, helper_image = DFLT_IMAGE, debug = False):
+    _connect_api(manager=True)
+
+    # extract node ID and container ID
+    t = task_info(task_id)
+    node_id = task_node(t)
+    container_id = task_container(t)
+
+    # display debug info on stderr, so it will show on error in Skopos step info
+    if debug:
+        print('EXEC: task {}, node {}, container {}, cmd "{}" (arguments stripped)'.
+            format(task_id, node_id, container_id, cmd[0]), file = sys.stderr)
+
+    # start a helper container on target node that will execute the command in the desired container
+    run_container(helper_image, node_id, timeout = timeout, args = ['exec', container_id] + cmd)
+
+def _task_log(tinfo):
+    if not tinfo:
+        return '(no task info)'
+
+    # resolve container and get log
+    try:
+        container_id = task_container(tinfo)    # will fail if on a different node - debug with same node only
+    except Exception as e:
+        return '(failed to get task\'s container ID: {})'.format(e.args[0])
+    c = gbl_api.containers.get(container_id)
+    binlog = c.logs(stdout = True, stderr = True)
+    txtlog = binlog.decode('utf-8') # assume UTF-8 - sdk doc erratum: logs() returns bytes, not str
+
+    return txtlog
+
+def run_container(  image,
+                    node,
+                    cmd      = None,
+                    args     = None,
+                    timeout  = DFLT_TIMEOUT,
+                    networks = []):
+    '''
+    run_container() runs a transient container on the specified swarm node, passing
+    the cmd command and arguments, and waits for the specified timeout for a completion.
+    It also mounts the swarm node's local docker socket.
+    Optionally, it can attach the container to specific networks
+    Raises exceptions on error, including non-zero exit code
+    '''
+    # create service
+    #print(type(args).__name__, args, file = sys.stderr)
+    try:
+        svc = gbl_api.services.create(
+            image          = image,
+            command        = cmd,
+            args           = args,
+            constraints    = [ 'node.id == {}'.format(node) ],
+            mounts         = [ '/var/run/docker.sock:/var/run/docker.sock'],
+            networks       = networks,
+            restart_policy = docker.types.RestartPolicy(condition='none')
+            )
+    except docker.errors.DockerException as e:
+        raise ApiError(e.args[0])
+    # any other exception will also provide traceback, likely bug
+
+    # From now on, remember to remove the service prior to returning
+
+    # wait for service to finish
+    task = {}               # initialize task structure
+    t0   = time.time()
+    exc  = None
+    try:
+        while time.time() - t0 <= float(timeout):
+            # wait a bit and refresh service state
+            time.sleep(1)
+            svc.reload()
+            tasks = svc.tasks()
+            if len(tasks) < 1: continue     # give it a bit more time
+
+            task = tasks[0] # there should be only one, never more
+            if not task_active(task):
+                break
+        else:
+            # raise exception to be caught below, no need to cleanup here
+            raise UserError('timed out waiting for command to complete')
+    except docker.errors.DockerException as e:
+        svc.remove()
+        raise ApiError(e.args[0])
+    except Exception: # any other exception will also provide traceback, likely bug
+        svc.remove()
+        raise
+
+    # (debug) display log - works only if helper runs on this node
+    #TODO: change when 'docker service logs' becomes commonplace; see https://github.com/moby/moby/issues/24812
+    #print(_task_log(task), file = sys.stderr) #@#@
+
+    # remember task outcome & destroy service
+    status = task.get('Status', {})
+    svc.remove()
+
+    # process state
+    if status.get('State', '') != 'complete':
+        err = 'exitcode:{code} (task state:"{state}", message:"{msg}", err:"{err}")'.format(
+            code  = status.get('ContainerStatus', {}).get('ExitCode','(unknown)'),
+            state = status.get('State', '(unknown)'),
+            msg   = status.get('Message', ''),
+            err   = status.get('Err', ''),
+            )
+        raise CmdError(err)
+
+# --- Top level handlers
+
+def cmd_task_exec(args):
+    # finalize container image to use
+    if len(args) >= 2 and args[0] == '--image':
+        img = args[1]
+        args = args[2:]
+    else:
+        img = DFLT_IMAGE
+
+    # extract arguments (at least task id and the command)
+    if len(args) < 2:
+        print('missing task_id and/or command to execute; run with --help for usage', file=sys.stderr)
+        exit(2)
+    task_id = args.pop(0)
+    cmd     = args              # list of all other values
+
+    try:
+        task_exec(task_id, cmd, helper_image = img)
+    except (ApiError, CmdError, UserError) as e:
+        print(e.args[0], file=sys.stderr)
+        sys.exit(1)
+
+def cmd_container_exec(args):
+    try:
+        _connect_api()
+    except ApiError as e:
+        print(e.args[0], file=sys.stderr)
+        sys.exit(1)
+
+    # extract arguments
+    if len(args) < 2:
+        print('missing container id and/or command to execute; run with --help for usage', file=sys.stderr)
+        exit(2)
+    container_id = args.pop(0)
+    cmd = args # all the rest, as a list
+
+    # execute command
+    api = gbl_api.containers.client.api
+    try:
+        xid = api.exec_create(container_id, cmd)
+        out = api.exec_start(xid)
+        ret = api.exec_inspect(xid)
+    except docker.errors.DockerException as e:
+        raise ApiError(e.args[0])
+
+    code = ret.get('ExitCode')
+    if code is None: code = 99  # FIXME - better value to indicate failure?
+
+    print(out.decode())
+    sys.exit(code)
+
+@action    # Skopos plugin action
+def inst_exec(**args):
+    # extract task ID
+    inst = args['inst']     # Skopos instance list (usually a single element)
+    if len(inst) != 1:
+        skpp.die('this plugin works only with a single instance at a time, got {}'.format(len(inst))) # may be 0
+    inst = inst[0]          # re-bind to the only instance
+    task_id = inst['id']    # must exist (with docker-swarm core plugin, instance ID is the task ID)
+
+    # extract command (and parse into a list if provided as JSON array)
+    assert 'command' in args, '"command" argument must be provided in order to execute command in task'
+    cmd = args['command']
+    assert isinstance(cmd, six.string_types)
+    if cmd.startswith('['):
+        cmd = json.loads(cmd) # load json-serialized array
+    else:
+        cmd = args['command'].split(' ')    # simple split on spaces
+
+    # determine helper image and timeout
+    if 'image' in args:
+        img = args['image']
+    else:
+        img = DFLT_IMAGE
+    if 'timeout' in args:
+        tout = args['timeout']
+    else:
+        tout = DFLT_TIMEOUT
+
+    # execute requested command in the specified task via helper
+    try:
+        task_exec(task_id, cmd, timeout = tout, helper_image = img, debug = True)
+    except (ApiError, CmdError, UserError) as e:
+        skpp.die(e.args[0])
+
+    # return empty data, no instance changes expected
+    return {}
+
+# --- Main Entry Point -------------------------------------------------------
+
+if __name__ == "__main__":
+    # usage:
+    #    swarm-exec task-exec [--image <imagespec>] <task_id> <command> <argv>...
+
+    args = copy(sys.argv)
+    me = args.pop(0)
+    if len(args) == 0 or ('--help' in args[:2]): # no args or --help or <cmd> --help
+        print(
+'''
+Usage:
+    swarm-exec task-exec [--image <imagespec>] <task_id> <command> <argv>...
+    swarm-exec exec <container_id> <command> <argv>...
+''',
+            file = sys.stderr)
+        sys.exit(2)
+
+    if args[0] == 'task-exec':
+        cmd_task_exec(args[1:])
+    elif args[0] == 'exec':
+        cmd_container_exec(args[1:])
+    else:
+        skpp.run("swarm-exec", globals())   # run as a Skopos plugin
+
