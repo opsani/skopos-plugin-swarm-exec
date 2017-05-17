@@ -2,9 +2,11 @@
 
 [![Join the chat at https://gitter.im/datagridsys/skopos](https://badges.gitter.im/datagridsys/skopos.svg)](https://gitter.im/datagridsys/skopos?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
-A tool for executing commands in service containers deployed on Docker Swarm, as well as
-a Skopos plugin for doing the same with the
-[Skopos Continuous Deployment System](http://datagridsys.com).
+A tool for executing commands in service containers deployed on Docker swarm - equivalent to:
+
+`docker service exec <task_id> <command> <args>`
+
+It also provides a Skopos plugin for doing the same in the [Skopos Continuous Deployment System](http://datagridsys.com).
 
 ## Background
 
@@ -15,12 +17,14 @@ mechanism for doing just that: executing a command in the container of a service
 Think of it as a `docker service exec` that applies to a specific task of a service.
 
 While this project is intended for use with the [Skopos Continuous Deployment System](http://datagridsys.com),
-it can be used as a standalone tool to provide the same capability.
+it can be used as a standalone tool to provide the same capability during the deployment process (see [FAQ](http://datagridsys.com/skopos-faq/)).
 
 The need for this project is expected to go away when the
 [Support for executing into a task #1895](https://github.com/docker/swarmkit/issues/1895)
-issue is resolved in the Docker Swarm project and the same capability becomes available
-directly in the Docker Swarm API and command-line client.
+issue is resolved in the Docker swarm project and the same capability becomes available
+directly in the Docker swarm API and command-line client. 
+
+The exec capability, together with `docker service logs` (already included in Docker 17.05.0-ce as non-experimental), a `docker service signal`, as well as pause/resume, will provide closure of the container operation functions between plain Docker containers and services that run containers on a swarm cluster.
 
 ## Standalone Use
 
@@ -147,6 +151,6 @@ This is an open source project. See the [LICENSE](LICENSE) file.
 
 ## Contributing
 
-If you want to propose an improvement, pull requests are always welcome!
+If you want to propose an improvement, issues and pull requests are always welcome!
 
-You can reach the maintainers on [Gitter](https://gitter.im/datagridsys/skopos).
+You can reach the project maintainers on [Gitter](https://gitter.im/datagridsys/skopos).
